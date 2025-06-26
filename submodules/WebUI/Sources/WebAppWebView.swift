@@ -4,6 +4,7 @@ import Display
 import WebKit
 import SwiftSignalKit
 import TelegramCore
+import Postbox
 
 private let findActiveElementY = """
 function getOffset(el) {
@@ -18,13 +19,13 @@ getOffset(document.activeElement).top;
 
 private class WeakGameScriptMessageHandler: NSObject, WKScriptMessageHandler {
     private let f: (WKScriptMessage) -> ()
-    
+
     init(_ f: @escaping (WKScriptMessage) -> ()) {
         self.f = f
-        
+
         super.init()
     }
-    
+
     func userContentController(_ controller: WKUserContentController, didReceive scriptMessage: WKScriptMessage) {
         self.f(scriptMessage)
     }
@@ -33,6 +34,111 @@ private class WeakGameScriptMessageHandler: NSObject, WKScriptMessageHandler {
 private class WebViewTouchGestureRecognizer: UITapGestureRecognizer {
     override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent) {
         self.state = .began
+    }
+}
+
+private final class TonSchemeHandler: NSObject, WKURLSchemeHandler {
+    private final class PendingTask {
+        let sourceTask: any WKURLSchemeTask
+        var urlSessionTask: URLSessionTask?
+        let isCompleted = Atomic<Bool>(value: false)
+
+        init(proxyServerHost: String, sourceTask: any WKURLSchemeTask) {
+            self.sourceTask = sourceTask
+
+            final class BoxedSourceTask: @unchecked Sendable {
+                let value: any WKURLSchemeTask
+
+                init(value: any WKURLSchemeTask) {
+                    self.value = value
+                }
+            }
+            let sourceTaskReference = BoxedSourceTask(value: sourceTask)
+
+            let requestUrl = sourceTask.request.url
+
+            var mappedHost: String = ""
+            if let host = sourceTask.request.url?.host {
+                mappedHost = host
+                mappedHost = mappedHost.replacingOccurrences(of: "-", with: "-h")
+                mappedHost = mappedHost.replacingOccurrences(of: ".", with: "-d")
+            }
+
+            var mappedPath = ""
+            if let path = sourceTask.request.url?.path, !path.isEmpty {
+                mappedPath = path
+                if !path.hasPrefix("/") {
+                    mappedPath = "/\(mappedPath)"
+                }
+            }
+            let mappedUrl = "https://\(mappedHost).\(proxyServerHost)\(mappedPath)"
+            let isCompleted = self.isCompleted
+            self.urlSessionTask = URLSession.shared.dataTask(with: URLRequest(url: URL(string: mappedUrl)!), completionHandler: { data, response, error in
+                if isCompleted.swap(true) {
+                    return
+                }
+
+                if let error {
+                    sourceTaskReference.value.didFailWithError(error)
+                } else {
+                    if let response {
+                        if let response = response as? HTTPURLResponse, let requestUrl {
+                            if let updatedResponse = HTTPURLResponse(
+                                url: requestUrl,
+                                statusCode: response.statusCode,
+                                httpVersion: "HTTP/1.1",
+                                headerFields: response.allHeaderFields as? [String: String] ?? [:]
+                            ) {
+                                sourceTaskReference.value.didReceive(updatedResponse)
+                            } else {
+                                sourceTaskReference.value.didReceive(response)
+                            }
+                        } else {
+                            sourceTaskReference.value.didReceive(response)
+                        }
+                    }
+                    if let data {
+                        sourceTaskReference.value.didReceive(data)
+                    }
+                    sourceTaskReference.value.didFinish()
+                }
+            })
+            self.urlSessionTask?.resume()
+        }
+
+        func cancel() {
+            if let urlSessionTask = self.urlSessionTask {
+                self.urlSessionTask = nil
+                if !self.isCompleted.swap(true) {
+                    switch urlSessionTask.state {
+                    case .running, .suspended:
+                        urlSessionTask.cancel()
+                    default:
+                        break
+                    }
+                }
+            }
+        }
+    }
+
+    private let proxyServerHost: String
+
+    private var pendingTasks: [PendingTask] = []
+
+    init(proxyServerHost: String) {
+        self.proxyServerHost = proxyServerHost
+    }
+
+    func webView(_ webView: WKWebView, start urlSchemeTask: any WKURLSchemeTask) {
+        self.pendingTasks.append(PendingTask(proxyServerHost: self.proxyServerHost, sourceTask: urlSchemeTask))
+    }
+
+    func webView(_ webView: WKWebView, stop urlSchemeTask: any WKURLSchemeTask) {
+        if let index = self.pendingTasks.firstIndex(where: { $0.sourceTask === urlSchemeTask }) {
+            let task = self.pendingTasks[index]
+            self.pendingTasks.remove(at: index)
+            task.cancel()
+        }
     }
 }
 
@@ -99,14 +205,14 @@ final class WebAppWebView: WKWebView {
             }
         }
     }
-        
+
     override var safeAreaInsets: UIEdgeInsets {
         return UIEdgeInsets(top: self.customInsets.top, left: self.customInsets.left, bottom: self.customInsets.bottom, right: self.customInsets.right)
     }
-    
+
     init(account: Account) {
         let configuration = WKWebViewConfiguration()
-                
+
         if #available(iOS 17.0, *) {
             var uuid: UUID?
             if let current = UserDefaults.standard.object(forKey: "TelegramWebStoreUUID_\(account.id.int64)") as? String {
@@ -119,35 +225,42 @@ final class WebAppWebView: WKWebView {
                     mainAccountId = account.id.int64
                     UserDefaults.standard.set(mainAccountId, forKey: "TelegramWebStoreMainAccountId")
                 }
-                
+
                 if account.id.int64 != mainAccountId {
                     uuid = UUID()
                     UserDefaults.standard.set(uuid!.uuidString, forKey: "TelegramWebStoreUUID_\(account.id.int64)")
                 }
             }
-            
+
             if let uuid {
                 configuration.websiteDataStore = WKWebsiteDataStore(forIdentifier: uuid)
             }
         }
-        
+
+        // Configure TonSchemeHandler for .ton domains
+        var proxyServerHost = "magic.org"
+        if let data = account.postbox.preferencesView(keys: [ApplicationSpecificPreferencesKeys.appConfiguration]).values[ApplicationSpecificPreferencesKeys.appConfiguration]?.get(AppConfiguration.self)?.data, let hostValue = data["ton_proxy_address"] as? String {
+            proxyServerHost = hostValue
+        }
+        configuration.setURLSchemeHandler(TonSchemeHandler(proxyServerHost: proxyServerHost), forURLScheme: "tonsite")
+
         let contentController = WKUserContentController()
-                           
+
         var handleScriptMessageImpl: ((WKScriptMessage) -> Void)?
         let eventProxyScript = WKUserScript(source: eventProxySource, injectionTime: .atDocumentStart, forMainFrameOnly: false)
         contentController.addUserScript(eventProxyScript)
         contentController.add(WeakGameScriptMessageHandler { message in
             handleScriptMessageImpl?(message)
         }, name: "performAction")
-        
+
         let selectionScript = WKUserScript(source: selectionSource, injectionTime: .atDocumentEnd, forMainFrameOnly: true)
         contentController.addUserScript(selectionScript)
-        
+
         let videoScript = WKUserScript(source: videoSource, injectionTime: .atDocumentStart, forMainFrameOnly: false)
         contentController.addUserScript(videoScript)
-        
+
         configuration.userContentController = contentController
-        
+
         configuration.allowsInlineMediaPlayback = true
         configuration.allowsPictureInPictureMediaPlayback = false
         if #available(iOS 10.0, *) {
@@ -155,11 +268,11 @@ final class WebAppWebView: WKWebView {
         } else {
             configuration.mediaPlaybackRequiresUserAction = true
         }
-        
+
         super.init(frame: CGRect(), configuration: configuration)
-        
+
         self.disablesInteractiveKeyboardGestureRecognizer = true
-        
+
         self.isOpaque = false
         self.backgroundColor = .clear
         if #available(iOS 9.0, *) {
@@ -174,26 +287,26 @@ final class WebAppWebView: WKWebView {
         self.allowsBackForwardNavigationGestures = false
         if #available(iOS 16.4, *) {
             self.isInspectable = true
-        } 
-        
+        }
+
         handleScriptMessageImpl = { [weak self] message in
             if let strongSelf = self {
                 strongSelf.handleScriptMessage(message)
             }
         }
     }
-    
+
     required init?(coder: NSCoder) {
         fatalError("init(coder:) has not been implemented")
     }
-    
+
     deinit {
         print()
     }
-    
+
     override func didMoveToSuperview() {
         super.didMoveToSuperview()
-        
+
         if #available(iOS 11.0, *) {
             let webScrollView = self.subviews.compactMap { $0 as? UIScrollView }.first
             Queue.mainQueue().after(0.1, {
@@ -203,13 +316,13 @@ final class WebAppWebView: WKWebView {
                 }
                 contentView?.removeInteraction(dragInteraction)
             })
-            
+
             NotificationCenter.default.removeObserver(self, name: UIResponder.keyboardWillChangeFrameNotification, object: nil)
             NotificationCenter.default.removeObserver(self, name: UIResponder.keyboardWillShowNotification, object: nil)
             NotificationCenter.default.removeObserver(self, name: UIResponder.keyboardWillHideNotification, object: nil)
         }
     }
-    
+
     func hideScrollIndicators() {
         var hiddenViews: [UIView] = []
         for view in self.scrollView.subviews.reversed() {
@@ -225,25 +338,25 @@ final class WebAppWebView: WKWebView {
             }
         }
     }
-    
+
     func sendEvent(name: String, data: String?) {
         let script = "window.TelegramGameProxy.receiveEvent(\"\(name)\", \(data ?? "null"))"
         self.evaluateJavaScript(script, completionHandler: { _, _ in
         })
     }
-        
+
     func updateMetrics(height: CGFloat, isExpanded: Bool, isStable: Bool, transition: ContainedViewLayoutTransition) {
         let viewportData = "{height:\(height), is_expanded:\(isExpanded ? "true" : "false"), is_state_stable:\(isStable ? "true" : "false")}"
         self.sendEvent(name: "viewport_changed", data: viewportData)
-        
+
         let safeInsetsData = "{top:\(self.customInsets.top), bottom:\(self.customInsets.bottom), left:\(self.customInsets.left), right:\(self.customInsets.right)}"
         self.sendEvent(name: "safe_area_changed", data: safeInsetsData)
     }
-    
+
     var lastTouchTimestamp: Double?
     private(set) var didTouchOnce = false
     var onFirstTouch: () -> Void = {}
-    
+
     func scrollToActiveElement(layout: ContainerViewLayout, completion: @escaping (CGPoint) -> Void, transition: ContainedViewLayoutTransition) {
         self.evaluateJavaScript(findActiveElementY, completionHandler: { result, _ in
             if let result = result as? CGFloat {
@@ -267,7 +380,7 @@ final class WebAppWebView: WKWebView {
             }
         })
     }
-    
+
     override func hitTest(_ point: CGPoint, with event: UIEvent?) -> UIView? {
         let result = super.hitTest(point, with: event)
         self.lastTouchTimestamp = CACurrentMediaTime()
@@ -277,7 +390,7 @@ final class WebAppWebView: WKWebView {
         }
         return result
     }
-    
+
     override var inputAccessoryView: UIView? {
         return nil
     }
